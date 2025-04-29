@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>three.js – FBXLoader con lluvia y niebla realista</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="main.css" type="text/css">
+  <style>
+    body { margin:0; overflow:hidden; }
+    canvas { display:block; }
+    #info {
+      position:absolute;
+      top:10px;
+      width:100%;
+      text-align:center;
+      z-index:2;
+      color:white;
+      font-family:sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <a href="https://threejs.org" target="_blank" rel="noopener" style="color:#0ff">
+      three.js
+    </a>
+    – FBXLoader con lluvia y niebla realista<br>
+    Character and animation from
+    <a href="https://www.mixamo.com/" target="_blank" rel="noopener" style="color:#0ff">
+      Mixamo
+    </a>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "../build/three.module.js",
+      "three/addons/": "./jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import Stats               from 'three/addons/libs/stats.module.js';
+    import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+    import { FBXLoader }       from 'three/addons/loaders/FBXLoader.js';
+    import { GUI }             from 'three/addons/libs/lil-gui.module.min.js';
+    import { RGBELoader }      from 'three/addons/loaders/RGBELoader.js';
+    import { Audio, AudioListener, AudioLoader } from 'three';
+
+    let camera, scene, renderer, stats, mixer, clock = new THREE.Clock();
+    let object, loader, guiMorphsFolder;
+    let rain, rainCount, rainSpeed, wind, fogNear, fogFar;
+    let rainArea = 4000, rainHeight = 800;
+
+    const params = { asset: 'Flair' };
+    const assets = [ 'Flair', 'morph_test' ];
+
+    init();
+
+    function init() {
+      const container = document.createElement('div');
+      document.body.appendChild(container);
+
+      // Cámara
+      camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 1, 2000);
+      camera.position.set(100,200,300);
+
+      // Escena y niebla lineal
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xa0a0a0);
+      fogNear = 100; fogFar = 800;
+      scene.fog = new THREE.Fog(0xffffff, fogNear, fogFar);
+
+      // Iluminación
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 5);
+      hemi.position.set(0,200,0);
+      scene.add(hemi);
+      const dir = new THREE.DirectionalLight(0xffffff,5);
+      dir.position.set(0,200,100);
+      dir.castShadow = true;
+      dir.shadow.camera.top = 180;
+      dir.shadow.camera.bottom = -100;
+      dir.shadow.camera.left = -120;
+      dir.shadow.camera.right = 120;
+      scene.add(dir);
+
+      // Suelo
+      const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(2000,2000),
+        new THREE.MeshPhongMaterial({ color:0x999999, depthWrite:false, fog:true })
+      );
+      floor.rotation.x = -Math.PI/2;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // Grid
+      const grid = new THREE.GridHelper(2000,20,0x000000,0x000000);
+      grid.material.opacity = 0.2;
+      grid.material.transparent = true;
+      scene.add(grid);
+
+      // Loader y modelo
+      loader = new FBXLoader(new THREE.LoadingManager());
+      loadAsset(params.asset);
+
+      // Renderer
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.setAnimationLoop(animate);
+      container.appendChild(renderer.domElement);
+
+      // OrbitControls
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0,100,0);
+      controls.update();
+      window.addEventListener('resize', onWindowResize);
+
+      // Stats
+      stats = new Stats();
+      container.appendChild(stats.dom);
+
+      // GUI para cambiar asset
+      const gui = new GUI();
+      gui.add(params,'asset',assets).onChange(v=>loadAsset(v));
+      guiMorphsFolder = gui.addFolder('Morphs').hide();
+
+      // HDR + Audio
+      new RGBELoader().load('models/rgbe/dirty_storehouse_4k.hdr', tex=>{
+        tex.mapping = THREE.EquirectangularReflectionMapping;
+        scene.background = tex;
+        scene.environment = tex;
+      });
+      const listener = new AudioListener();
+      camera.add(listener);
+      const sound = new Audio(listener);
+      new AudioLoader().load('models/rgbe/dead tree.mp3', buf=>{
+        sound.setBuffer(buf);
+        sound.setLoop(true);
+        sound.setVolume(0.5);
+        sound.play();
+      });
+
+      // AxesHelper opcional
+      scene.add(new THREE.AxesHelper(5));
+
+      // ————— SETUP LLUVIA EXPANDIDA —————
+      rainCount = 20000;
+      const geo = new THREE.BufferGeometry();
+      const pos = new Float32Array(rainCount * 3);
+      for (let i = 0; i < rainCount; i++) {
+        pos[i*3]   = Math.random() * rainArea - rainArea/2;
+        pos[i*3+1] = Math.random() * rainHeight;
+        pos[i*3+2] = Math.random() * rainArea - rainArea/2;
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const rainMat = new THREE.PointsMaterial({
+        color: 0xffffff,
+        size: 0.5,
+        fog: false
+      });
+      rain = new THREE.Points(geo, rainMat);
+      scene.add(rain);
+      rainSpeed = 1;
+      wind = 0;
+
+      // Teclado: controla lluvia y niebla
+      window.addEventListener('keydown', e=>{
+        const k = e.key.toLowerCase();
+        switch(k) {
+          // LLUVIA
+          case 'arrowup':    rainSpeed += 0.5; break;
+          case 'arrowdown':  rainSpeed = Math.max(rainSpeed - 0.5, 0.1); break;
+          case 'r': rain.material.color.set(0xff0000); break;
+          case 'g': rain.material.color.set(0x00ff00); break;
+          case 'b': rain.material.color.set(0x0000ff); break;
+          case 'w': rain.material.color.set(0xffffff); break;
+          case 'v': wind += 0.5; break;
+          // NEBLINA LINEAL
+          case 'a': scene.fog.color.set(0xff0000); break;
+          case 's': scene.fog.color.set(0x00ff00); break;
+          case 'd': scene.fog.color.set(0x0000ff); break;
+          case 'f': scene.fog.color.set(0xffffff); break;
+          // Flechas invertidas: ahora ← disminuye niebla, → la aumenta
+          case 'arrowleft':
+            fogFar = Math.min(fogFar + 50, 2000);
+            scene.fog.far = fogFar;
+            break;
+          case 'arrowright':
+            fogFar = Math.max(fogFar - 50, fogNear + 50);
+            scene.fog.far = fogFar;
+            break;
+        }
+      });
+
+    } // fin init()
+
+    function loadAsset(asset) {
+      const path = asset === 'Flair'
+        ? 'models/fbx/Zombie Walk.fbx'
+        : 'models/fbx/morph_test.fbx';
+      loader.load(path, grp=>{
+        if (object) {
+          object.traverse(c=>{
+            if (c.material) {
+              const mats = Array.isArray(c.material) ? c.material : [c.material];
+              mats.forEach(m=>{
+                if (m.map) m.map.dispose();
+                m.dispose();
+              });
+            }
+            if (c.geometry) c.geometry.dispose();
+          });
+          scene.remove(object);
+        }
+        object = grp;
+        if (object.animations?.length) {
+          mixer = new THREE.AnimationMixer(object);
+          mixer.clipAction(object.animations[0]).play();
+        } else {
+          mixer = null;
+        }
+        guiMorphsFolder.children.forEach(c=>c.destroy());
+        guiMorphsFolder.hide();
+        object.traverse(c=>{
+          if (c.isMesh) {
+            c.material = new THREE.MeshStandardMaterial({
+              color: 0x4b1206,
+              transparent: true,
+              opacity: 0.7,
+              roughness: 0.3,
+              metalness: 0.9,
+              wireframe: true,
+              fog: false
+            });
+            c.castShadow = true;
+            c.receiveShadow = true;
+            if (c.morphTargetDictionary) {
+              guiMorphsFolder.show();
+              const f = guiMorphsFolder.addFolder(c.name || c.uuid);
+              Object.keys(c.morphTargetDictionary).forEach(key=>{
+                f.add(
+                  c.morphTargetInfluences,
+                  c.morphTargetDictionary[key],
+                  0,1,0.01
+                );
+              });
+            }
+          }
+        });
+        scene.add(object);
+      });
+    }
+
+    function onWindowResize() {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    }
+
+    function animate() {
+      // Actualiza lluvia
+      const arr = rain.geometry.attributes.position.array;
+      for (let i = 0; i < rainCount; i++) {
+        arr[i*3+1] -= rainSpeed;
+        arr[i*3]   += wind;
+        if (arr[i*3+1] < 0) {
+          arr[i*3+1] = rainHeight;
+          arr[i*3]   = Math.random() * rainArea - rainArea/2;
+          arr[i*3+2] = Math.random() * rainArea - rainArea/2;
+        }
+      }
+      rain.geometry.attributes.position.needsUpdate = true;
+
+      // Render + animaciones
+      const delta = clock.getDelta();
+      if (mixer) mixer.update(delta);
+      renderer.render(scene, camera);
+      stats.update();
+    }
+  </script>
+</body>
+</html>
